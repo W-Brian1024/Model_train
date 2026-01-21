@@ -2,13 +2,15 @@
 """
 基于真实 Zephyr 源码生成判断型训练样本
 从模块分析结果中获取文件列表，分析源码，生成样本
+支持样本多样化和自动分割（65:20:15）
 """
 
 import json
 import re
+import random
 from pathlib import Path
 from typing import Dict, List, Set
-from collections import defaultdict
+from collections import defaultdict, Counter
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -191,24 +193,45 @@ class JudgmentSampleGenerator:
 
         samples = []
 
-        # 1. 从源文件中提取函数，生成函数分析样本
+        # 1. 从源文件中提取函数，生成函数分析样本（60%）
+        target_func_samples = int(num_samples * 0.6)
         functions_samples = self._generate_function_analysis_samples(
-            module_id, module_info, num_samples // 2
+            module_id, module_info, target_func_samples
         )
         samples.extend(functions_samples)
+        logger.info(f"  📝 函数分析样本: 期望 {target_func_samples}, 实际 {len(functions_samples)}")
 
-        # 2. 从API使用中生成判断样本
+        # 2. 从API使用中生成判断样本（40%）
+        target_api_samples = num_samples - len(samples)
         api_samples = self._generate_api_usage_samples(
-            module_id, module_info, num_samples // 2
+            module_id, module_info, target_api_samples
         )
         samples.extend(api_samples)
+        logger.info(f"  🔧 API使用样本: 期望 {target_api_samples}, 实际 {len(api_samples)}")
 
-        # 3. 如果还不够，生成通用样本
+        # 3. 如果还不够，尝试生成更多样本
         if len(samples) < num_samples:
-            generic_samples = self._generate_generic_samples(
-                module_id, module_info, num_samples - len(samples)
+            remaining = num_samples - len(samples)
+            logger.warning(f"⚠️ 样本数量不足 {len(samples)}/{num_samples}，尝试生成更多...")
+
+            # 尝试从更多文件生成
+            additional_samples = self._generate_additional_samples(
+                module_id, module_info, remaining
             )
-            samples.extend(generic_samples)
+            samples.extend(additional_samples)
+            logger.info(f"  ➕ 额外样本: {len(additional_samples)}")
+
+        # 4. 如果还是不够，重复使用现有样本创建变体
+        if len(samples) < num_samples:
+            logger.warning(f"⚠️ 仍然不足 {len(samples)}/{num_samples}，创建样本变体...")
+            while len(samples) < num_samples and samples:
+                # 随机选择一个样本，创建轻微变体
+                base_sample = random.choice(samples)
+                variant = self._create_sample_variant(base_sample, len(samples))
+                if variant:
+                    samples.append(variant)
+
+        logger.info(f"✅ 实际生成样本数: {len(samples)}/{num_samples}")
 
         # 限制到请求的数量
         return samples[:num_samples]
@@ -219,8 +242,10 @@ class JudgmentSampleGenerator:
         """基于函数分析生成样本"""
         samples = []
         files = module_info.get('files', [])
+        skipped_short = 0
+        skipped_failed = 0
 
-        for file_path in files[:20]:  # 最多处理20个文件
+        for file_path in files:  # 处理所有文件，不再限制20个
             if len(samples) >= num_samples:
                 break
 
@@ -234,8 +259,15 @@ class JudgmentSampleGenerator:
                 sample = self._create_function_sample(module_id, func, file_path)
                 if sample:
                     samples.append(sample)
+                else:
+                    # 追踪为什么失败
+                    func_body = func.get('body', '')
+                    if len(func_body) < 50:
+                        skipped_short += 1
+                    else:
+                        skipped_failed += 1
 
-        logger.info(f"  📝 生成了 {len(samples)} 个函数分析样本")
+        logger.info(f"  📝 生成了 {len(samples)} 个函数分析样本 (跳过: {skipped_short}太短, {skipped_failed}失败)")
         return samples
 
     def _generate_api_usage_samples(
@@ -300,7 +332,8 @@ class JudgmentSampleGenerator:
         # 清理函数体
         clean_body = self._clean_code(func_body[:300])
 
-        if not clean_body or len(clean_body) < 50:
+        # 降低最小长度要求：从50降到30
+        if not clean_body or len(clean_body) < 30:
             return None
 
         # 分析代码特征
@@ -762,16 +795,73 @@ File: {file_path}
 
         return '\n'.join(lines).strip()
 
-    def save_samples(self, module_id: str, samples: List[Dict]):
-        """保存样本"""
+    def _generate_additional_samples(
+        self, module_id: str, module_info: Dict, num_samples: int
+    ) -> List[Dict]:
+        """生成额外样本（当常规方法不足时）"""
+        samples = []
+        files = module_info.get('files', [])
+
+        # 从更多文件中提取函数
+        for file_path in files:
+            if len(samples) >= num_samples:
+                break
+
+            functions = self.analyzer.extract_functions_from_file(file_path)
+            for func in functions:
+                if len(samples) >= num_samples:
+                    break
+
+                # 尝试创建通用样本（更宽松的条件）
+                sample = self._create_general_function_sample(
+                    module_id, func['name'], func['body'][:500], file_path
+                )
+                if sample:
+                    # 标记为额外样本
+                    sample['is_additional'] = True
+                    samples.append(sample)
+
+        return samples
+
+    def _create_sample_variant(self, base_sample: Dict, index: int) -> Dict:
+        """基于现有样本创建变体（轻微修改）"""
+        import copy
+        variant = copy.deepcopy(base_sample)
+
+        # 修改instruction
+        instruction = variant['instruction']
+        if 'analyze' in instruction.lower():
+            variant['instruction'] = instruction.replace('analyze', 'review', 1)
+        elif 'review' in instruction.lower():
+            variant['instruction'] = instruction.replace('review', 'examine', 1)
+        else:
+            variant['instruction'] = "Re-evaluate: " + instruction
+
+        # 修改output，添加说明
+        variant['output'] = f"[Variation #{index}]\n" + variant['output']
+
+        # 标记为变体
+        variant['is_variant'] = True
+        variant['variant_of'] = base_sample.get('file', '') + '_' + str(index)
+
+        return variant
+
+    def save_samples(self, module_id: str, samples: List[Dict], output_dir: str = 'dataset/modules'):
+        """保存样本
+
+        Args:
+            module_id: 模块ID
+            samples: 样本列表
+            output_dir: 输出目录（默认：dataset/modules）
+        """
         if not samples:
             logger.warning(f"模块 {module_id} 没有生成样本")
             return
 
-        output_dir = Path('dataset/modules')
-        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
 
-        output_file = output_dir / f"{module_id}_samples.json"
+        output_file = output_path / f"{module_id}_samples.json"
 
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(samples, f, ensure_ascii=False, indent=2)
@@ -791,10 +881,286 @@ File: {file_path}
             logger.info(f"  {cat}: {count}")
 
 
+class SampleDiversifier:
+    """样本多样化器 - 添加'噪音'打破模式"""
+
+    # Instruction变体模板
+    INSTRUCTION_TEMPLATES = {
+        'code_review': [
+            "Review the implementation of `{func}` in Zephyr and identify potential issues.",
+            "Analyze whether `{func}` follows Zephyr BLE best practices.",
+            "Evaluate the code quality of `{func}` implementation.",
+            "Does `{func}` in this Zephyr code conform to BLE standards?",
+            "Check if `{func}` has any implementation issues.",
+            "Assess the correctness of `{func}` in the provided code.",
+            "Examine `{func}` for potential problems or violations.",
+        ],
+        'api_usage': [
+            "Is the use of `{api}` correct according to Zephyr BLE APIs?",
+            "Evaluate the usage of `{api}` in this code snippet.",
+            "Does this code properly use the Zephyr `{api}` API?",
+            "Review the `{api}` API usage for correctness.",
+            "Check if `{api}` is used appropriately here.",
+            "Analyze the `{api}` function call in this context.",
+        ],
+        'boundary_analysis': [
+            "Analyze `{func}` implementation for boundary condition handling.",
+            "Does `{func}` properly validate inputs and handle edge cases?",
+            "Review the safety checks in `{func}` implementation.",
+            "Evaluate whether `{func}` correctly handles boundary conditions.",
+            "Check `{func}` for potential buffer overflow or input validation issues.",
+        ]
+    }
+
+    # Output开头变体
+    OUTPUT_OPENINGS = {
+        'correct': [
+            "✅ **正确实现**",
+            "✅ **符合规范要求**",
+            "✅ **代码质量良好**",
+            "✅ **完全符合Zephyr标准**",
+            "✅ **实现正确且安全**",
+        ],
+        'warning': [
+            "⚠️ **部分正确，需要改进**",
+            "⚠️ **基本合格，有优化空间**",
+            "⚠️ **存在小问题，建议修复**",
+            "⚠️ **大部分正确，需补充检查**",
+        ],
+        'incorrect': [
+            "❌ **实现不正确**",
+            "❌ **存在安全隐患**",
+            "❌ **违反协议要求**",
+            "❌ **代码质量不佳**",
+        ]
+    }
+
+    def __init__(self, samples: List[Dict]):
+        self.samples = samples
+
+    def diversify_65_20_15(self, module_id: str, output_dir: str = 'dataset/modules') -> Dict:
+        """按65:20:15比例分割样本集
+
+        分割规则:
+        - 65% 直接生成的样本（原始样本，用于训练）
+        - 20% 偏差样本（多样化变体，verdict被翻转，用于训练）
+        - 15% 正确样本（从原始样本中筛选verdict='correct'，用于验证）
+
+        Args:
+            module_id: 模块ID
+            output_dir: 输出目录
+
+        Returns:
+            包含train, validation, complete的字典
+        """
+        total_samples = len(self.samples)
+
+        # 计算各部分数量
+        num_train_original = int(total_samples * 0.65)  # 65% 原始样本
+        num_biased = int(total_samples * 0.20)          # 20% 偏差样本
+        num_validation = int(total_samples * 0.15)      # 15% 正确样本
+
+        # 1. 提取正确样本（用于验证集）
+        correct_samples = [s for s in self.samples if s['verdict_type'] == 'correct']
+
+        # 如果正确样本不够15%，随机抽取needs_review样本补足
+        if len(correct_samples) < num_validation:
+            needs_review_samples = [s for s in self.samples if s['verdict_type'] == 'needs_review']
+            additional = num_validation - len(correct_samples)
+            correct_samples.extend(random.sample(needs_review_samples, min(additional, len(needs_review_samples))))
+
+        # 随机打乱并选择验证样本
+        random.shuffle(correct_samples)
+        validation_samples = correct_samples[:num_validation]
+
+        # 2. 选择训练用的原始样本（65%）
+        remaining_samples = [s for s in self.samples if s not in validation_samples]
+        random.shuffle(remaining_samples)
+        train_original_samples = remaining_samples[:num_train_original]
+
+        # 3. 生成偏差样本（20%）
+        samples_for_biased = random.sample(train_original_samples, min(num_biased, len(train_original_samples)))
+        biased_samples = []
+        for sample in samples_for_biased:
+            variant = self._create_variant(sample, target_correct_ratio=0.3)
+            if variant:
+                variant['sample_type'] = 'biased'
+                biased_samples.append(variant)
+
+        # 4. 标记样本类型
+        for s in train_original_samples:
+            s['sample_type'] = 'train_original'
+        for s in validation_samples:
+            s['sample_type'] = 'validation'
+
+        # 5. 保存为三个文件
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        # 训练集（原始+偏差）
+        train_samples = train_original_samples + biased_samples
+        train_file = output_path / f"{module_id}_train.json"
+        with open(train_file, 'w', encoding='utf-8') as f:
+            json.dump(train_samples, f, ensure_ascii=False, indent=2)
+
+        # 验证集
+        val_file = output_path / f"{module_id}_validation.json"
+        with open(val_file, 'w', encoding='utf-8') as f:
+            json.dump(validation_samples, f, ensure_ascii=False, indent=2)
+
+        # 完整数据集（合并）
+        complete_samples = train_samples + validation_samples
+        complete_file = output_path / f"{module_id}_complete.json"
+        with open(complete_file, 'w', encoding='utf-8') as f:
+            json.dump(complete_samples, f, ensure_ascii=False, indent=2)
+
+        # 打印统计
+        print("\n" + "="*80)
+        print("📊 样本集分割完成 (65:20:15)")
+        print("="*80)
+        print(f"\n原始样本总数: {total_samples}")
+        print(f"\n分割结果:")
+        print(f"  📁 训练集（原始）:  {len(train_original_samples):3d} ({len(train_original_samples)/total_samples*100:.1f}%)")
+        print(f"  📁 训练集（偏差）:  {len(biased_samples):3d} ({len(biased_samples)/total_samples*100:.1f}%)")
+        print(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print(f"  📁 训练集总计:      {len(train_samples):3d} ({len(train_samples)/total_samples*100:.1f}%)")
+        print(f"  📁 验证集:          {len(validation_samples):3d} ({len(validation_samples)/total_samples*100:.1f}%)")
+        print(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print(f"  📁 完整数据集:      {len(complete_samples):3d} (100%)")
+
+        print(f"\n✅ 已保存文件:")
+        print(f"  - {train_file}")
+        print(f"  - {val_file}")
+        print(f"  - {complete_file}")
+
+        # 详细统计
+        self._print_split_stats(train_samples, validation_samples)
+
+        return {
+            'train': train_samples,
+            'validation': validation_samples,
+            'complete': complete_samples
+        }
+
+    def _create_variant(self, sample: Dict, target_correct_ratio: float = 0.5) -> Dict:
+        """创建样本变体"""
+        variant = sample.copy()
+
+        # 1. 随机化instruction措辞
+        variant['instruction'] = self._vary_instruction(sample)
+
+        # 2. 强制平衡verdict
+        variant['verdict_type'], variant['output'] = self._force_balance_verdict(
+            sample, target_correct_ratio
+        )
+
+        # 标记为多样性样本
+        variant['is_diverse'] = True
+        variant['original_sample_id'] = sample.get('file', '') + '_' + sample.get('category', '')
+
+        return variant
+
+    def _vary_instruction(self, sample: Dict) -> str:
+        """随机化instruction措辞"""
+        category = sample['category']
+        instruction = sample['instruction']
+
+        # 提取函数名或API名
+        if '`' in instruction:
+            import re
+            match = re.search(r'`([^`]+)`', instruction)
+            if match:
+                name = match.group(1)
+
+                # 选择同类别下的随机模板
+                if category in self.INSTRUCTION_TEMPLATES:
+                    templates = self.INSTRUCTION_TEMPLATES[category]
+                    template = random.choice(templates)
+
+                    # 替换占位符
+                    if '{func}' in template:
+                        return template.replace('{func}', name)
+                    elif '{api}' in template:
+                        return template.replace('{api}', name)
+
+        return instruction
+
+    def _force_balance_verdict(self, sample: Dict, target_ratio: float) -> tuple:
+        """强制平衡verdict"""
+        output = sample['output']
+
+        # 根据目标比例决定verdict
+        if random.random() < target_ratio:
+            new_verdict = 'correct'
+            emoji = '✅'
+            opening = random.choice(self.OUTPUT_OPENINGS['correct'])
+        else:
+            new_verdict = 'needs_review'
+            emoji = '❌' if random.random() < 0.5 else '⚠️'
+            if emoji == '❌':
+                opening = random.choice(self.OUTPUT_OPENINGS['incorrect'])
+            else:
+                opening = random.choice(self.OUTPUT_OPENINGS['warning'])
+
+        # 替换output开头的verdict标记
+        lines = output.split('\n')
+        if '❌' in lines[0] or '✅' in lines[0] or '⚠️' in lines[0]:
+            lines[0] = opening
+            output = '\n'.join(lines)
+
+        return new_verdict, output
+
+    def _print_split_stats(self, train_samples: List[Dict], val_samples: List[Dict]):
+        """打印分割后的统计信息"""
+        print("\n" + "="*80)
+        print("📊 详细统计")
+        print("="*80)
+
+        # 训练集统计
+        print(f"\n🎯 训练集 Verdict 分布:")
+        train_verdicts = [s['verdict_type'] for s in train_samples]
+        train_verdict_counter = Counter(train_verdicts)
+        for verdict, count in train_verdict_counter.most_common():
+            pct = count / len(train_samples) * 100
+            bar = '█' * int(pct / 5)
+            print(f"  {verdict:20s}: {bar} {count:3d} ({pct:5.1f}%)")
+
+        # 训练集样本类型分布
+        print(f"\n📁 训练集 样本类型分布:")
+        train_types = [s.get('sample_type', 'unknown') for s in train_samples]
+        train_type_counter = Counter(train_types)
+        for sample_type, count in train_type_counter.most_common():
+            pct = count / len(train_samples) * 100
+            bar = '█' * int(pct / 5)
+            print(f"  {sample_type:20s}: {bar} {count:3d} ({pct:5.1f}%)")
+
+        # 验证集统计
+        print(f"\n🎯 验证集 Verdict 分布:")
+        val_verdicts = [s['verdict_type'] for s in val_samples]
+        val_verdict_counter = Counter(val_verdicts)
+        for verdict, count in val_verdict_counter.most_common():
+            pct = count / len(val_samples) * 100
+            bar = '█' * int(pct / 5)
+            print(f"  {verdict:20s}: {bar} {count:3d} ({pct:5.1f}%)")
+
+        # Instruction多样性
+        train_instructions = []
+        for s in train_samples:
+            words = s['instruction'].split()[:5]
+            train_instructions.append(' '.join(words))
+
+        train_instruction_counter = Counter(train_instructions)
+        print(f"\n📝 训练集 Instruction 唯一模式数: {len(train_instruction_counter)}")
+
+        print("\n" + "="*80)
+
+
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="基于真实Zephyr源码生成判断型训练样本")
+    parser = argparse.ArgumentParser(
+        description="基于真实Zephyr源码生成判断型训练样本，支持多样化和自动分割"
+    )
     parser.add_argument(
         '--zephyr',
         type=str,
@@ -819,6 +1185,17 @@ def main():
         default=50,
         help='生成样本数量'
     )
+    parser.add_argument(
+        '--split-65-20-15',
+        action='store_true',
+        help='按65:20:15比例分割样本集（65%%原始训练+20%%偏差训练+15%%验证）'
+    )
+    parser.add_argument(
+        '--output-dir',
+        type=str,
+        default='dataset/modules',
+        help='输出目录（默认：dataset/modules）'
+    )
 
     args = parser.parse_args()
 
@@ -826,10 +1203,24 @@ def main():
     generator = JudgmentSampleGenerator(args.zephyr, args.module_analysis)
 
     # 生成样本
+    logger.info(f"🎯 开始为模块 {args.module} 生成 {args.num_samples} 个样本...")
     samples = generator.generate_for_module(args.module, args.num_samples)
 
-    # 保存
-    generator.save_samples(args.module, samples)
+    if args.split_65_20_15:
+        # 使用65:20:15分割
+        logger.info("📊 使用65:20:15分割模式...")
+        diversifier = SampleDiversifier(samples)
+        result = diversifier.diversify_65_20_15(args.module, args.output_dir)
+
+        logger.info(f"\n✅ 完成！生成了以下文件：")
+        logger.info(f"  - 训练集: {args.output_dir}/{args.module}_train.json ({len(result['train'])}个样本)")
+        logger.info(f"  - 验证集: {args.output_dir}/{args.module}_validation.json ({len(result['validation'])}个样本)")
+        logger.info(f"  - 完整集: {args.output_dir}/{args.module}_complete.json ({len(result['complete'])}个样本)")
+    else:
+        # 保存原始样本
+        logger.info("💾 保存原始样本...")
+        generator.save_samples(args.module, samples, args.output_dir)
+        logger.info(f"✅ 完成！样本已保存到: {args.output_dir}/{args.module}_samples.json")
 
     return 0
 
