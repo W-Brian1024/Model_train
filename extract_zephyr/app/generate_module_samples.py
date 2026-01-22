@@ -17,14 +17,90 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+class CodeFeatureDetector:
+    """代码特征检测器 - 改进版，更准确的模式匹配"""
+
+    @staticmethod
+    def has_connection_check(code: str) -> bool:
+        """检测连接检查 - 改进版"""
+        # 精确匹配：if (!conn) 或 if (conn == NULL) 等
+        patterns = [
+            r'if\s*\(\s*!\s*conn\s*\)',
+            r'if\s*\(\s*conn\s*==\s*NULL\s*\)',
+            r'if\s*\(\s*!?conn\s*&&',
+            r'if\s*\(\s*!?conn\s*\|\|',
+        ]
+        return any(re.search(pattern, code) for pattern in patterns)
+
+    @staticmethod
+    def has_null_pointer_check(code: str) -> bool:
+        """检测空指针检查"""
+        patterns = [
+            r'if\s*\(\s*!\s*\w+\s*\)',          # if (!ptr)
+            r'if\s*\(\s*\w+\s*==\s*NULL\s*\)',  # if (ptr == NULL)
+            r'if\s*\(\s*NULL\s*==\s*\w+\s*\)',  # if (NULL == ptr)
+            r'if\s*\(\s*!\s*\w+\s*&&',          # if (!ptr &&
+        ]
+        return any(re.search(pattern, code) for pattern in patterns)
+
+    @staticmethod
+    def has_boundary_check(code: str) -> bool:
+        """检测边界检查"""
+        patterns = [
+            r'if\s*\([^)]*<[^)]*\)',              # if (x < max)
+            r'if\s*\([^)]*>[^)]*\)',              # if (x > min)
+            r'if\s*\([^)]*<=[^)]*\)',             # if (x <= max)
+            r'if\s*\([^)]*>=[^)]*\)',             # if (x >= min)
+            r'if\s*\([^)]*&&\s*[^)]*[<>]=?',   # if (x && x < max)
+        ]
+        return any(re.search(pattern, code) for pattern in patterns)
+
+    @staticmethod
+    def has_error_handling(code: str) -> bool:
+        """检测错误处理"""
+        # 检查返回值是否被检查
+        patterns = [
+            r'if\s*\([^)]*err[^)]*\)',           # if (err ...)
+            r'if\s*\([^)]*ret[^)]*\)',           # if (ret ...)
+            r'return\s+-(E|EN)',
+            r'BT_GATT_ERR\s*\(',
+        ]
+        return any(re.search(pattern, code) for pattern in patterns)
+
+    @staticmethod
+    def has_buffer_overflow_protection(code: str) -> bool:
+        """检测缓冲区溢出保护"""
+        patterns = [
+            r'memcpy\s*\([^,]+,\s*[^,]+,\s*min\s*\(',
+            r'snprintf\s*\(',
+            r'strncpy\s*\(',
+            r'if\s*\([^)]*len\s*>\s*[^)]*\)',
+            r'if\s*\([^)]*size\s*>\s*[^)]*\)',
+        ]
+        return any(re.search(pattern, code) for pattern in patterns)
+
+    @staticmethod
+    def has_ccc_check(code: str) -> bool:
+        """检测CCC（Client Characteristic Configuration）检查"""
+        patterns = [
+            r'ccc.*flags',
+            r'BT_GATT_CCC',
+            r'notify.*enabled',
+            r'config.*notify',
+        ]
+        code_lower = code.lower()
+        return any(re.search(pattern.lower(), code_lower) for pattern in patterns)
+
+
 class ZephyrCodeAnalyzer:
     """Zephyr 代码分析器 - 从源码中提取信息"""
 
     def __init__(self, zephyr_path: str):
         self.zephyr_path = Path(zephyr_path)
+        self.detector = CodeFeatureDetector()  # 使用改进的检测器
 
     def extract_functions_from_file(self, file_path: str) -> List[Dict]:
-        """从文件中提取函数定义"""
+        """从文件中提取函数定义（改进版）"""
         full_path = self.zephyr_path / file_path
         if not full_path.exists():
             return []
@@ -38,43 +114,97 @@ class ZephyrCodeAnalyzer:
 
         functions = []
 
-        # 匹配函数定义
-        # 模式：返回类型 函数名(参数) { 函数体
-        pattern = r'(?:static\s+)?(?:const\s+)?(?:\w+\s+)+?(\w+)\s*\([^)]*\)\s*\{'
+        # 改进的正则表达式 - 更严格的函数定义匹配
+        # 支持更多C语法特性：指针、宏、复杂类型等
+        patterns = [
+            # 标准函数定义: int func_name(type param, ...)
+            r'(?:static\s+)?(?:inline\s+)?(?:const\s+)?(?:struct\s+\w+\s+)?(?:\w+\s+(?:\*+\s*)*)+(\w+)\s*\([^)]*\)\s*\{',
+            # 函数指针: int (*func_name)(...)
+            r'(?:static\s+)?(?:const\s+)?(?:\w+\s+)+?\(\**\s*(\w+)\s*\)\s*\([^)]*\)\s*\{',
+        ]
 
-        matches = re.finditer(pattern, content)
+        # 跳过的函数（系统函数、标准库函数等）
+        skip_functions = {
+            'printk', 'memcpy', 'memset', 'strlen', 'strcmp', 'strncmp',
+            'strcpy', 'strncpy', 'sprintf', 'snprintf', 'vsprintf',
+            'malloc', 'free', 'calloc', 'realloc',
+            'printf', 'fprintf', 'scanf', 'sscanf',
+        }
 
-        for match in matches:
-            func_name = match.group(1)
+        for pattern in patterns:
+            matches = re.finditer(pattern, content, re.MULTILINE)
+            for match in matches:
+                func_name = match.group(1)
 
-            # 跳过一些函数
-            if func_name.startswith('_') and len(func_name) < 3:
-                continue
-            if func_name in ['printk', 'memcpy', 'memset', 'strlen']:
-                continue
+                # 跳过特定函数
+                if not func_name or func_name in skip_functions:
+                    continue
 
-            # 获取函数体（简化版）
-            start_pos = match.start()
-            brace_start = content.find('{', start_pos)
+                # 跳过纯小写的内部函数（通常是宏或特殊定义）
+                if func_name.islower() and len(func_name) < 3:
+                    continue
 
-            if brace_start == -1:
-                continue
+                # 获取函数体（改进版）
+                start_pos = match.start()
+                brace_start = content.find('{', start_pos)
 
-            # 提取函数体前500字符作为样本
-            brace_end = self._find_matching_brace(content, brace_start)
-            if brace_end == -1:
-                func_body = content[brace_start:brace_start+500]
-            else:
-                func_body = content[brace_start:min(brace_end, brace_start+500)]
+                if brace_start == -1:
+                    continue
 
-            functions.append({
-                'name': func_name,
-                'file': file_path,
-                'body': func_body,
-                'start': start_pos
-            })
+                # 提取函数体，最多500字符
+                brace_end = self._find_matching_brace(content, brace_start)
+                if brace_end == -1:
+                    func_body = content[brace_start:brace_start+500]
+                else:
+                    func_body = content[brace_start:min(brace_end, brace_start+500)]
+
+                # 计算函数复杂度（用于难度分级）
+                complexity = self._calculate_function_complexity(func_body)
+
+                functions.append({
+                    'name': func_name,
+                    'file': file_path,
+                    'body': func_body,
+                    'start': start_pos,
+                    'complexity': complexity
+                })
 
         return functions
+
+    def _calculate_function_complexity(self, func_body: str) -> Dict:
+        """计算函数复杂度（用于难度分级）"""
+        # 代码长度
+        code_length = len(func_body)
+
+        # 嵌套深度（括号嵌套）
+        max_nesting = 0
+        current_nesting = 0
+        for char in func_body:
+            if char == '{':
+                current_nesting += 1
+                max_nesting = max(max_nesting, current_nesting)
+            elif char == '}':
+                current_nesting = max(0, current_nesting - 1)
+
+        # 控制流关键字数量
+        control_flow_count = sum([
+            func_body.count('if '),
+            func_body.count('for '),
+            func_body.count('while '),
+            func_body.count('switch'),
+            func_body.count('return')
+        ])
+
+        # API调用次数
+        api_call_count = len(re.findall(r'bt_\w+\s*\(', func_body))
+
+        return {
+            'length': code_length,
+            'nesting_depth': max_nesting,
+            'control_flow_count': control_flow_count,
+            'api_call_count': api_call_count,
+            'score': code_length / 100 + max_nesting * 2 + control_flow_count * 0.5
+        }
 
     def _find_matching_brace(self, content: str, start: int, max_search: int = 2000) -> int:
         """查找匹配的右括号"""
@@ -172,17 +302,76 @@ class ZephyrCodeAnalyzer:
 class JudgmentSampleGenerator:
     """判断型样本生成器 - 基于真实代码"""
 
-    def __init__(self, zephyr_path: str, module_analysis_file: str):
+    def __init__(self, zephyr_path: str, module_analysis_file: str, debug: bool = False):
         self.zephyr_path = Path(zephyr_path)
         self.analyzer = ZephyrCodeAnalyzer(zephyr_path)
         self.module_data = self._load_module_analysis(module_analysis_file)
+        self.debug = debug  # Debug模式开关
+
+        if self.debug:
+            logger.info("🐛 Debug模式已启用 - 将显示详细日志")
+
+    def _filter_module_files(self, module_id: str, files: List[str]) -> List[str]:
+        """过滤文件，只保留模块相关的文件
+
+        Args:
+            module_id: 模块ID (如 'host_gatt')
+            files: 文件路径列表
+
+        Returns:
+            过滤后的文件列表
+        """
+        filtered_files = []
+
+        # 定义模块相关的关键词映射
+        module_keywords = {
+            'host_gatt': ['gatt', 'attribute', 'char', 'service', 'descriptor', 'ccc', 'value'],
+            'host_att': ['att', 'attribute', 'handle', 'permission', 'mtu', 'opcode'],
+            'host_l2cap': ['l2cap', 'chan', 'coc', 'le', 'ecred', 'sdu'],
+            'host_conn': ['conn', 'connect', 'disconnect', 'pairing', 'encryption', 'bond'],
+            'host_smp': ['smp', 'pairing', 'security', 'tk', 'irk', 'csrk', 'ltk'],
+            'host_adv': ['adv', 'advertiser', 'ad', 'ad_data', 'scan', 'dirc'],
+            'host_scan': ['scan', 'scanner', 'scan_data', 'adv'],
+            'host_hci': ['hci', 'h_vs', 'cmd', 'event'],
+            'ctrl_ll': ['ll', 'ctrl', 'radio', 'phy', 'tick'],
+            'ctrl_hci': ['hci', 'vendor'],
+        }
+
+        # 获取当前模块的关键词
+        keywords = module_keywords.get(module_id, [])
+
+        if not keywords:
+            # 如果没有定义关键词，保留所有文件
+            if self.debug:
+                logger.warning(f"  ⚠️ 模块 {module_id} 没有定义关键词，将处理所有文件")
+            return files
+
+        # 过滤文件
+        for file_path in files:
+            file_name = file_path.lower()
+
+            # 检查文件是否包含任何模块关键词
+            if any(keyword in file_name for keyword in keywords):
+                filtered_files.append(file_path)
+            elif 'include' in file_name:
+                # 头文件也可能包含重要内容
+                filtered_files.append(file_path)
+
+        if self.debug:
+            logger.info(f"  📁 文件过滤: {len(files)} → {len(filtered_files)}")
+            logger.info(f"     关键词: {', '.join(keywords)}")
+
+        return filtered_files
 
     def _load_module_analysis(self, analysis_file: str) -> Dict:
         """加载模块分析结果"""
         with open(analysis_file, 'r', encoding='utf-8') as f:
             return json.load(f)
 
-    def generate_for_module(self, module_id: str, num_samples: int = 50) -> List[Dict]:
+    def generate_for_module(
+        self, module_id: str, num_samples: int = 50,
+        include_cross_module: bool = False, cross_module_targets: List[str] = None
+    ) -> List[Dict]:
         """为指定模块生成样本"""
         if module_id not in self.module_data["modules"]:
             logger.error(f"模块不存在: {module_id}")
@@ -233,8 +422,39 @@ class JudgmentSampleGenerator:
 
         logger.info(f"✅ 实际生成样本数: {len(samples)}/{num_samples}")
 
+        # 5. (可选) 生成跨模块调用样本
+        if include_cross_module and cross_module_targets:
+            logger.info("🔗 生成跨模块调用样本...")
+            cross_module_samples = []
+
+            for target_module in cross_module_targets:
+                if target_module == module_id:
+                    continue  # 跳过自己
+
+                module_samples = self.analyze_cross_module_calls(
+                    module_id, target_module
+                )
+                cross_module_samples.extend(module_samples)
+
+            if cross_module_samples:
+                # 限制跨模块样本数量（最多20%）
+                max_cross = max(10, int(num_samples * 0.2))
+                samples.extend(cross_module_samples[:max_cross])
+                logger.info(f"  🔗 跨模块样本: {len(cross_module_samples[:max_cross])}")
+
+        # 6. 质量验证和过滤
+        logger.info("🔍 开始质量验证...")
+        valid_samples = self.filter_and_validate_samples(samples)
+
+        logger.info(f"✅ 最终有效样本数: {len(valid_samples)}/{num_samples}")
+
+        # 如果有效样本不足，返回原始数量（可能包含低质量样本）
+        if len(valid_samples) < num_samples * 0.8:  # 如果有效样本少于80%
+            logger.warning(f"⚠️ 有效样本数量过少 ({len(valid_samples)}/{num_samples})，返回所有样本")
+            return samples[:num_samples]
+
         # 限制到请求的数量
-        return samples[:num_samples]
+        return valid_samples[:num_samples]
 
     def _generate_function_analysis_samples(
         self, module_id: str, module_info: Dict, num_samples: int
@@ -242,23 +462,45 @@ class JudgmentSampleGenerator:
         """基于函数分析生成样本"""
         samples = []
         files = module_info.get('files', [])
+
+        # 过滤文件：只处理模块相关的文件
+        files = self._filter_module_files(module_id, files)
+
         skipped_short = 0
         skipped_failed = 0
 
-        for file_path in files:  # 处理所有文件，不再限制20个
+        if self.debug:
+            logger.info(f"  🔍 开始分析 {len(files)} 个文件...")
+
+        for idx, file_path in enumerate(files):  # 处理所有文件，不再限制20个
             if len(samples) >= num_samples:
+                if self.debug:
+                    logger.info(f"  ✓ 已达到目标样本数 {num_samples}")
                 break
+
+            if self.debug:
+                logger.info(f"  [{idx+1}/{len(files)}] 处理文件: {file_path}")
 
             functions = self.analyzer.extract_functions_from_file(file_path)
 
-            for func in functions:
+            if self.debug:
+                logger.info(f"    - 提取到 {len(functions)} 个函数")
+
+            for func_idx, func in enumerate(functions):
                 if len(samples) >= num_samples:
                     break
+
+                if self.debug and func_idx < 3:  # 只显示前3个函数的详情
+                    logger.info(f"      [{func_idx+1}] 函数: {func['name']}")
+                    logger.info(f"          复杂度分数: {func.get('complexity', {}).get('score', 0):.2f}")
+                    logger.info(f"          代码长度: {len(func.get('body', ''))} 字符")
 
                 # 生成函数分析样本
                 sample = self._create_function_sample(module_id, func, file_path)
                 if sample:
                     samples.append(sample)
+                    if self.debug and len(samples) <= 5:  # 只显示前5个成功样本
+                        logger.info(f"          ✅ 生成样本成功: {sample.get('category', 'unknown')} - {sample.get('difficulty', 'unknown')}")
                 else:
                     # 追踪为什么失败
                     func_body = func.get('body', '')
@@ -276,16 +518,31 @@ class JudgmentSampleGenerator:
         """基于API使用生成样本"""
         samples = []
         files = module_info.get('files', [])
+
+        # 过滤文件：只处理模块相关的文件
+        files = self._filter_module_files(module_id, files)
+
         apis = module_info.get('apis', [])
 
         # 从API名称推断前缀
         api_prefixes = self._extract_api_prefixes(apis)
 
-        for file_path in files[:10]:
+        if self.debug:
+            logger.info(f"  🔍 分析 {len(files)} 个文件中的API使用...")
+
+        for idx, file_path in enumerate(files[:10]):
             if len(samples) >= num_samples:
+                if self.debug:
+                    logger.info(f"  ✓ 已达到目标样本数 {num_samples}")
                 break
 
+            if self.debug:
+                logger.info(f"  [{idx+1}/{len(files)}] 处理文件: {file_path}")
+
             patterns = self.analyzer.extract_api_usage_patterns(file_path, api_prefixes)
+
+            if self.debug:
+                logger.info(f"    - 找到 {len(patterns)} 个API使用模式")
 
             for pattern in patterns:
                 if len(samples) >= num_samples:
@@ -294,6 +551,8 @@ class JudgmentSampleGenerator:
                 sample = self._create_api_usage_sample(module_id, pattern, file_path)
                 if sample:
                     samples.append(sample)
+                    if self.debug and len(samples) <= 3:
+                        logger.info(f"      ✅ 生成API使用样本")
 
         logger.info(f"  🔧 生成了 {len(samples)} 个API使用样本")
         return samples
@@ -309,21 +568,39 @@ class JudgmentSampleGenerator:
                 prefixes.add(prefix)
         return list(prefixes)
 
+    def _calculate_difficulty(self, complexity_score: float) -> str:
+        """根据复杂度分数计算难度等级"""
+        if complexity_score < 3:
+            return "beginner"
+        elif complexity_score < 7:
+            return "intermediate"
+        else:
+            return "advanced"
+
     def _create_function_sample(self, module_id: str, func: Dict, file_path: str) -> Dict:
         """创建函数分析样本"""
         func_name = func['name']
         func_body = func['body']
+        complexity = func.get('complexity', {})
         file_rel = file_path
 
         # 根据函数名判断类型
         if 'read' in func_name or 'write' in func_name:
-            return self._create_read_write_sample(module_id, func_name, func_body, file_rel)
+            sample = self._create_read_write_sample(module_id, func_name, func_body, file_rel)
         elif 'notify' in func_name or 'indicate' in func_name:
-            return self._create_notify_sample(module_id, func_name, func_body, file_rel)
+            sample = self._create_notify_sample(module_id, func_name, func_body, file_rel)
         elif 'discovery' in func_name or 'discover' in func_name:
-            return self._create_discovery_sample(module_id, func_name, func_body, file_rel)
+            sample = self._create_discovery_sample(module_id, func_name, func_body, file_rel)
         else:
-            return self._create_general_function_sample(module_id, func_name, func_body, file_rel)
+            sample = self._create_general_function_sample(module_id, func_name, func_body, file_rel)
+
+        # 动态设置难度等级
+        if sample and complexity:
+            difficulty = self._calculate_difficulty(complexity.get('score', 0))
+            sample['difficulty'] = difficulty
+            sample['complexity'] = complexity
+
+        return sample
 
     def _create_read_write_sample(
         self, module_id: str, func_name: str, func_body: str, file_path: str
@@ -336,11 +613,13 @@ class JudgmentSampleGenerator:
         if not clean_body or len(clean_body) < 30:
             return None
 
-        # 分析代码特征
-        has_offset_check = 'offset' in clean_body and ('if' in clean_body or 'check' in clean_body.lower())
-        has_len_check = ('len' in clean_body or 'sizeof' in clean_body or 'size' in clean_body) and '>' in clean_body
-        has_error_handling = ('return' in clean_body) and ('err' in clean_body or 'EINVAL' in clean_body or 'BT_ATT' in clean_body)
-        has_null_check = 'NULL' in clean_body or ('!' in clean_body and ('ptr' in clean_body or 'conn' in clean_body))
+        # 使用改进的特征检测器
+        detector = self.analyzer.detector
+        has_offset_check = detector.has_boundary_check(clean_body) and 'offset' in clean_body
+        has_len_check = detector.has_boundary_check(clean_body) and ('len' in clean_body or 'size' in clean_body)
+        has_error_handling = detector.has_error_handling(clean_body)
+        has_null_check = detector.has_null_pointer_check(clean_body)
+        has_overflow_protect = detector.has_buffer_overflow_protection(clean_body)
 
         # 计算质量分数
         checks_passed = sum([has_offset_check, has_len_check, has_error_handling, has_null_check])
@@ -420,11 +699,11 @@ class JudgmentSampleGenerator:
         """创建通知相关样本"""
         clean_body = self._clean_code(func_body[:300])
 
-        # 分析代码特征
-        has_conn_check = 'conn' in clean_body and ('if' in clean_body or '!' in clean_body)
-        has_ccc_check = ('ccc' in clean_body.lower() or 'config' in clean_body.lower() or
-                         'notify' in clean_body.lower() or 'enabled' in clean_body.lower())
-        has_error_handling = 'err' in clean_body and ('return' in clean_body or 'if' in clean_body)
+        # 使用改进的特征检测器
+        detector = self.analyzer.detector
+        has_conn_check = detector.has_connection_check(clean_body)
+        has_ccc_check = detector.has_ccc_check(clean_body)
+        has_error_handling = detector.has_error_handling(clean_body)
         has_enobufs_check = 'ENOBUFS' in clean_body or 'ENOENT' in clean_body
 
         # 计算合规性分数
@@ -846,6 +1125,355 @@ File: {file_path}
 
         return variant
 
+    def _detect_error_patterns(self, code: str) -> List[str]:
+        """检测代码中的潜在错误模式
+
+        Returns:
+            检测到的错误模式列表
+        """
+        error_patterns = []
+
+        # 1. Buffer Overflow风险
+        if re.search(r'memcpy\s*\([^,]+,\s*[^,]+,\s*[^)]+\)', code):
+            # 检查是否有边界检查
+            if not re.search(r'memcpy\s*\([^,]+,\s*[^,]+,\s*min\s*\(', code):
+                if not re.search(r'strncpy\s*\(', code):
+                    error_patterns.append("buffer_overflow")
+
+        # 2. Null Pointer解引用风险
+        if re.search(r'(\w+)\s*->', code):
+            # 检查指针使用前是否有NULL检查
+            ptr_access = re.findall(r'(\w+)\s*->', code)
+            for ptr in set(ptr_access):
+                if not re.search(rf'if\s*\(\s*!?\s*{ptr}\s*\)', code):
+                    error_patterns.append("null_pointer_dereference")
+                    break
+
+        # 3. Double Free风险
+        free_calls = re.findall(r'k_free\s*\(([^)]+)\)', code)
+        if len(free_calls) > 1:
+            freed_vars = [var.strip() for var in free_calls]
+            if len(freed_vars) != len(set(freed_vars)):
+                error_patterns.append("double_free")
+
+        # 4. Use After Free风险
+        for i, free_call in enumerate(free_calls):
+            var = free_call.strip()
+            # 检查free后是否还使用该变量
+            remaining_code = code[code.find(free_call) + len(free_call):]
+            if var in remaining_code and 'k_free' not in remaining_code[:100]:
+                error_patterns.append("use_after_free")
+                break
+
+        # 5. Missing Error Check
+        func_calls = re.findall(r'(\w+)\s*\([^)]*\)\s*;', code)
+        error_returning_funcs = ['bt_gatt_', 'bt_att_', 'k_malloc', 'net_buf_']
+        for func in func_calls:
+            if any(err_func in func for err_func in error_returning_funcs):
+                # 检查返回值是否被检查
+                if not re.search(rf'if\s*\([^)]*{func}', code):
+                    error_patterns.append("missing_error_check")
+                    break
+
+        # 6. Integer Overflow风险
+        if re.search(r'(\w+)\s*\+\s*\1', code):  # x + x可能溢出
+            if 'size_t' in code or 'u32_t' in code or 'u16_t' in code:
+                error_patterns.append("integer_overflow")
+
+        # 7. 未初始化变量使用
+        if re.search(r'(int|char|u8_t|u16_t|u32_t)\s+(\w+)\s*;', code):
+            # 检查变量声明后直接使用
+            declarations = re.findall(r'(int|char|u8_t|u16_t|u32_t)\s+(\w+)\s*;', code)
+            for decl in declarations:
+                var = decl[1]
+                # 简单检查：声明后立即使用
+                pattern = rf'{decl[0]}\s+{var}\s*;[^;}}]*{var}\s*[=)]'
+                if re.search(pattern, code):
+                    error_patterns.append("uninitialized_variable")
+                    break
+
+        return list(set(error_patterns))  # 去重
+
+    def analyze_cross_module_calls(
+        self, module_a: str, module_b: str
+    ) -> List[Dict]:
+        """分析模块A如何调用模块B
+
+        Args:
+            module_a: 调用方模块ID (如 'host_gatt')
+            module_b: 被调用方模块ID (如 'host_att')
+
+        Returns:
+            跨模块调用样本列表
+        """
+        if module_a not in self.module_data["modules"]:
+            logger.warning(f"模块 {module_a} 不存在")
+            return []
+
+        if module_b not in self.module_data["modules"]:
+            logger.warning(f"模块 {module_b} 不存在")
+            return []
+
+        module_a_info = self.module_data["modules"][module_a]
+        module_b_info = self.module_data["modules"][module_b]
+        module_b_name = module_b_info['info']['name']
+
+        # 获取模块B的API列表
+        module_b_apis = set(module_b_info.get('apis', []))
+
+        if not module_b_apis:
+            logger.warning(f"模块 {module_b} 没有API定义")
+            return []
+
+        # 提取模块B的API前缀
+        api_prefixes = []
+        for api in list(module_b_apis)[:20]:  # 限制数量
+            # 提取前缀，如 bt_att_ -> bt_att_
+            parts = api.split('_')
+            if len(parts) >= 2:
+                prefix = '_'.join(parts[:2]) + '_'
+                api_prefixes.append(prefix)
+
+        api_prefixes = list(set(api_prefixes))
+
+        # 在模块A的文件中搜索对模块B API的调用
+        samples = []
+        files_a = module_a_info.get('files', [])
+
+        for file_path in files_a[:10]:  # 限制文件数量
+            if len(samples) >= 20:  # 限制样本数量
+                break
+
+            full_path = self.zephyr_path / file_path
+            if not full_path.exists():
+                continue
+
+            try:
+                with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+            except Exception:
+                continue
+
+            # 搜索对模块B API的调用
+            for prefix in api_prefixes:
+                pattern = rf'.{{0,300}}{re.escape(prefix)}[\w_]+\s*\([^)]*\)[^;}}]*;'
+                matches = re.finditer(pattern, content, re.MULTILINE | re.DOTALL)
+
+                for match in matches:
+                    code_snippet = match.group(0).strip()
+
+                    if len(code_snippet) < 50 or len(code_snippet) > 500:
+                        continue
+
+                    # 提取API名称
+                    api_match = re.search(rf'{re.escape(prefix)}(\w+)', code_snippet)
+                    if not api_match:
+                        continue
+
+                    api_name = prefix + api_match.group(1)
+
+                    # 分析调用特征
+                    sample = self._create_cross_module_sample(
+                        module_a, module_b, module_b_name,
+                        api_name, code_snippet, file_path
+                    )
+
+                    if sample:
+                        samples.append(sample)
+
+                    if len(samples) >= 20:
+                        break
+
+                if len(samples) >= 20:
+                    break
+
+        logger.info(f"  🔗 跨模块调用样本 ({module_a}->{module_b}): {len(samples)}")
+        return samples
+
+    def _create_cross_module_sample(
+        self, caller_module: str, callee_module: str, callee_name: str,
+        api_name: str, code_snippet: str, file_path: str
+    ) -> Dict:
+        """创建跨模块API调用检查样本"""
+
+        # 使用改进的特征检测器
+        detector = self.analyzer.detector
+
+        # 检查API调用特征
+        has_return_check = detector.has_error_handling(code_snippet)
+        has_null_check = detector.has_null_pointer_check(code_snippet)
+        has_error_handling = 'err' in code_snippet and 'if' in code_snippet
+
+        # 检查参数验证
+        has_param_validation = (
+            'if' in code_snippet and
+            ('!' in code_snippet or 'NULL' in code_snippet or 'valid' in code_snippet.lower())
+        )
+
+        # 计算合规性分数
+        checks_passed = sum([
+            has_return_check,
+            has_null_check,
+            has_error_handling,
+            has_param_validation
+        ])
+
+        # 给出判断
+        if checks_passed >= 3:
+            verdict = "✅"
+            verdict_text = "**正确调用**"
+            analysis = f"正确使用了 {callee_name} 的 API，包含必要的错误检查和参数验证。"
+        elif checks_passed >= 2:
+            verdict = "⚠️"
+            verdict_text = "**部分正确**"
+            analysis = f"API调用基本正确，但建议补充 {'错误处理' if not has_error_handling else '参数验证'}。"
+        else:
+            verdict = "❌"
+            verdict_text = "**调用不正确**"
+            analysis = f"缺少必要的错误检查（仅通过 {checks_passed}/4 项），可能导致运行时错误。"
+
+        return {
+            "module": caller_module,
+            "instruction": f"检查 {caller_module} 模块对 `{callee_name}` API (`{api_name}`) 的调用是否正确？",
+            "input": f"""
+调用方模块: {caller_module}
+被调用模块: {callee_module} ({callee_name})
+API: {api_name}
+
+```c
+{code_snippet}
+```
+""",
+            "output": f"""{verdict} {verdict_text}
+
+## 跨模块API调用分析
+
+**API名称：** `{api_name}`
+**调用关系：** {caller_module} → {callee_name}
+
+**判断依据：**
+{analysis}
+
+### 调用合规性检查
+
+{'✅' if has_return_check else '❌'} **返回值检查** - {'检查了API返回值' if has_return_check else '未检查返回值'}
+{'✅' if has_null_check else '❌'} **空指针检查** - {'验证了指针有效性' if has_null_check else '缺少指针验证'}
+{'✅' if has_error_handling else '❌'} **错误处理** - {'包含错误处理逻辑' if has_error_handling else '缺少错误处理'}
+{'✅' if has_param_validation else '❌'} **参数验证** - {'验证了参数有效性' if has_param_validation else '缺少参数验证'}
+
+### 集成测试要点
+- 确保模块间接口契约被遵守
+- 验证返回值和错误码
+- 检查资源释放和生命周期管理
+
+### 参考文档
+- **API文档**: {callee_name} API Reference
+- **接口规范**: Zephyr BLE模块接口规范
+- **源码**: `subsys/bluetooth/{file_path}`
+
+{'' if checks_passed >= 3 else f"""
+### 改进建议
+1. 始终检查API返回值
+2. 验证指针参数（NULL检查）
+3. 处理所有可能的错误码
+4. 遵循API使用规范"""}
+""",
+            "category": "api_usage",
+            "difficulty": "intermediate" if checks_passed >= 2 else "advanced",
+            "verdict_type": "correct" if checks_passed >= 3 else "needs_review",
+            "source": "zephyr_code",
+            "file": file_path,
+            "cross_module": {
+                "caller": caller_module,
+                "callee": callee_module,
+                "api": api_name
+            }
+        }
+
+    def _create_error_pattern_sample(
+        self, module_id: str, func_name: str, func_body: str,
+        file_path: str, error_pattern: str
+    ) -> Dict:
+        """基于错误模式创建样本"""
+        clean_body = self._clean_code(func_body[:300])
+
+        if not clean_body or len(clean_body) < 30:
+            return None
+
+        # 根据错误类型生成不同的output
+        error_descriptions = {
+            "buffer_overflow": "缓冲区溢出风险 - memcpy未验证目标缓冲区大小",
+            "null_pointer_dereference": "空指针解引用风险 - 指针使用前未检查NULL",
+            "double_free": "双重释放风险 - 同一指针被释放多次",
+            "use_after_free": "释放后使用风险 - 内存被释放后仍被访问",
+            "missing_error_check": "缺少错误检查 - 函数返回值未验证",
+            "integer_overflow": "整数溢出风险 - 算术运算可能导致溢出",
+            "uninitialized_variable": "未初始化变量 - 变量在使用前未赋初值"
+        }
+
+        severity_levels = {
+            "buffer_overflow": "critical",
+            "null_pointer_dereference": "critical",
+            "double_free": "high",
+            "use_after_free": "high",
+            "missing_error_check": "medium",
+            "integer_overflow": "medium",
+            "uninitialized_variable": "low"
+        }
+
+        severity = severity_levels.get(error_pattern, "unknown")
+        description = error_descriptions.get(error_pattern, "未知错误模式")
+
+        return {
+            "module": module_id,
+            "instruction": f"分析 `{func_name}` 函数中的 `{error_pattern}` 安全风险",
+            "input": f"""
+文件：{file_path}
+函数：{func_name}
+错误模式：{error_pattern}
+
+```c
+{clean_body}
+```
+""",
+            "output": f"""❌ **存在安全风险：{description}**
+
+## 代码安全分析
+
+**错误模式：** `{error_pattern}`
+**严重程度：** {severity.upper()}
+
+### 风险描述
+{description}
+
+### 潜在影响
+- **安全漏洞**: 可能导致系统崩溃或被攻击
+- **数据损坏**: 内存损坏导致数据不一致
+- **不稳定**: 随机失败难以复现
+
+### 修复建议
+1. 添加边界检查
+2. 验证指针有效性
+3. 检查函数返回值
+4. 使用安全的内存操作函数
+
+### 参考规范
+- **CWE**: {error_pattern.upper()} 相关CWE条目
+- **MISRA C**: 规则X.X - 相关编码规范
+
+### 源码参考
+- **文件**: `subsys/bluetooth/{file_path}`
+- **函数**: `{func_name}()`
+""",
+            "category": "security_check",
+            "difficulty": "advanced",
+            "verdict_type": "needs_review",
+            "source": "zephyr_code",
+            "file": file_path,
+            "error_pattern": error_pattern,
+            "severity": severity
+        }
+
     def save_samples(self, module_id: str, samples: List[Dict], output_dir: str = 'dataset/modules'):
         """保存样本
 
@@ -879,6 +1507,105 @@ File: {file_path}
         logger.info("\n📊 类别分布:")
         for cat, count in sorted(categories.items()):
             logger.info(f"  {cat}: {count}")
+
+    def validate_sample_quality(self, sample: Dict) -> tuple:
+        """验证单个样本的质量
+
+        Returns:
+            (is_valid, issues): (是否有效, 问题列表)
+        """
+        issues = []
+
+        # 检查1：必须有instruction
+        if not sample.get('instruction') or len(sample.get('instruction', '')) < 10:
+            issues.append("instruction太短或缺失")
+
+        # 检查2：必须有input
+        if not sample.get('input'):
+            issues.append("input缺失")
+
+        # 检查3：input必须包含代码块
+        if 'input' in sample and '```c' not in sample.get('input', ''):
+            issues.append("input缺少代码块标记")
+
+        # 检查4：必须有output
+        if not sample.get('output') or len(sample.get('output', '')) < 50:
+            issues.append("output太短或缺失")
+
+        # 检查5：output必须包含分析内容
+        output = sample.get('output', '')
+        if output:
+            # 检查是否包含判断依据
+            if '判断依据' not in output and '分析' not in output and 'Analysis' not in output:
+                issues.append("output缺少分析依据")
+
+            # 检查是否包含协议规范引用
+            if 'Bluetooth' not in output and 'BLE' not in output and '协议' not in output:
+                issues.append("output缺少协议规范引用")
+
+        # 检查6：必须有verdict_type
+        if sample.get('verdict_type') not in ['correct', 'needs_review']:
+            issues.append("verdict_type无效，必须是correct或needs_review")
+
+        # 检查7：必须有category
+        valid_categories = [
+            'protocol_compliance', 'boundary_analysis', 'api_usage',
+            'code_review', 'security_check'
+        ]
+        if sample.get('category') not in valid_categories:
+            issues.append(f"category无效: {sample.get('category')}")
+
+        # 检查8：必须有difficulty
+        valid_difficulties = ['beginner', 'intermediate', 'advanced']
+        if sample.get('difficulty') not in valid_difficulties:
+            issues.append(f"difficulty无效: {sample.get('difficulty')}")
+
+        # 检查9：必须有source
+        if sample.get('source') != 'zephyr_code':
+            issues.append("source必须是zephyr_code")
+
+        # 检查10：必须有file
+        if not sample.get('file'):
+            issues.append("file缺失")
+
+        is_valid = len(issues) == 0
+        return is_valid, issues
+
+    def filter_and_validate_samples(self, samples: List[Dict]) -> List[Dict]:
+        """过滤并验证样本质量
+
+        Returns:
+            valid_samples: 通过验证的样本列表
+        """
+        valid_samples = []
+        invalid_count = 0
+        issue_stats = {}
+
+        for sample in samples:
+            is_valid, issues = self.validate_sample_quality(sample)
+
+            if is_valid:
+                valid_samples.append(sample)
+            else:
+                invalid_count += 1
+                # 统计问题类型
+                for issue in issues:
+                    issue_stats[issue] = issue_stats.get(issue, 0) + 1
+
+        # 打印统计
+        total = len(samples)
+        valid = len(valid_samples)
+        logger.info(f"\n📊 样本质量验证:")
+        logger.info(f"  总样本数: {total}")
+        logger.info(f"  ✅ 有效样本: {valid} ({valid/total*100:.1f}%)")
+        logger.info(f"  ❌ 无效样本: {invalid_count} ({invalid_count/total*100:.1f}%)")
+
+        if issue_stats:
+            logger.info(f"\n⚠️ 主要问题:")
+            for issue, count in sorted(issue_stats.items(), key=lambda x: x[1], reverse=True)[:5]:
+                logger.info(f"  - {issue}: {count}次")
+
+        return valid_samples
 
 
 class SampleDiversifier:
@@ -938,13 +1665,13 @@ class SampleDiversifier:
     def __init__(self, samples: List[Dict]):
         self.samples = samples
 
-    def diversify_65_20_15(self, module_id: str, output_dir: str = 'dataset/modules') -> Dict:
-        """按65:20:15比例分割样本集
+    def diversify_70_20_10(self, module_id: str, output_dir: str = 'dataset/modules') -> Dict:
+        """按70:20:10比例分割样本集
 
         分割规则:
-        - 65% 直接生成的样本（原始样本，用于训练）
+        - 70% 直接生成的样本（原始样本，用于训练）
         - 20% 偏差样本（多样化变体，verdict被翻转，用于训练）
-        - 15% 正确样本（从原始样本中筛选verdict='correct'，用于验证）
+        - 10% 正确样本（从原始样本中筛选verdict='correct'，用于验证）
 
         Args:
             module_id: 模块ID
@@ -956,14 +1683,14 @@ class SampleDiversifier:
         total_samples = len(self.samples)
 
         # 计算各部分数量
-        num_train_original = int(total_samples * 0.65)  # 65% 原始样本
+        num_train_original = int(total_samples * 0.70)  # 70% 原始样本
         num_biased = int(total_samples * 0.20)          # 20% 偏差样本
-        num_validation = int(total_samples * 0.15)      # 15% 正确样本
+        num_validation = int(total_samples * 0.10)      # 10% 正确样本
 
         # 1. 提取正确样本（用于验证集）
         correct_samples = [s for s in self.samples if s['verdict_type'] == 'correct']
 
-        # 如果正确样本不够15%，随机抽取needs_review样本补足
+        # 如果正确样本不够10%，随机抽取needs_review样本补足
         if len(correct_samples) < num_validation:
             needs_review_samples = [s for s in self.samples if s['verdict_type'] == 'needs_review']
             additional = num_validation - len(correct_samples)
@@ -973,7 +1700,7 @@ class SampleDiversifier:
         random.shuffle(correct_samples)
         validation_samples = correct_samples[:num_validation]
 
-        # 2. 选择训练用的原始样本（65%）
+        # 2. 选择训练用的原始样本（70%）
         remaining_samples = [s for s in self.samples if s not in validation_samples]
         random.shuffle(remaining_samples)
         train_original_samples = remaining_samples[:num_train_original]
@@ -1016,7 +1743,7 @@ class SampleDiversifier:
 
         # 打印统计
         print("\n" + "="*80)
-        print("📊 样本集分割完成 (65:20:15)")
+        print("📊 样本集分割完成 (70:20:10)")
         print("="*80)
         print(f"\n原始样本总数: {total_samples}")
         print(f"\n分割结果:")
@@ -1186,9 +1913,9 @@ def main():
         help='生成样本数量'
     )
     parser.add_argument(
-        '--split-65-20-15',
+        '--split-70-20-10',
         action='store_true',
-        help='按65:20:15比例分割样本集（65%%原始训练+20%%偏差训练+15%%验证）'
+        help='按70:20:10比例分割样本集（70%%原始训练+20%%偏差训练+10%%验证）'
     )
     parser.add_argument(
         '--output-dir',
@@ -1196,21 +1923,43 @@ def main():
         default='dataset/modules',
         help='输出目录（默认：dataset/modules）'
     )
+    parser.add_argument(
+        '--cross-module',
+        action='store_true',
+        help='启用跨模块调用分析（生成集成测试样本）'
+    )
+    parser.add_argument(
+        '--cross-module-targets',
+        type=str,
+        nargs='+',
+        default=None,
+        help='跨模块分析目标模块列表（如: host_att host_l2cap）'
+    )
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help='启用debug模式（显示详细日志）'
+    )
 
     args = parser.parse_args()
 
     # 创建生成器
-    generator = JudgmentSampleGenerator(args.zephyr, args.module_analysis)
+    generator = JudgmentSampleGenerator(args.zephyr, args.module_analysis, debug=args.debug)
 
     # 生成样本
     logger.info(f"🎯 开始为模块 {args.module} 生成 {args.num_samples} 个样本...")
-    samples = generator.generate_for_module(args.module, args.num_samples)
+    samples = generator.generate_for_module(
+        args.module,
+        args.num_samples,
+        include_cross_module=args.cross_module,
+        cross_module_targets=args.cross_module_targets
+    )
 
-    if args.split_65_20_15:
-        # 使用65:20:15分割
-        logger.info("📊 使用65:20:15分割模式...")
+    if args.split_70_20_10:
+        # 使用70:20:10分割
+        logger.info("📊 使用70:20:10分割模式...")
         diversifier = SampleDiversifier(samples)
-        result = diversifier.diversify_65_20_15(args.module, args.output_dir)
+        result = diversifier.diversify_70_20_10(args.module, args.output_dir)
 
         logger.info(f"\n✅ 完成！生成了以下文件：")
         logger.info(f"  - 训练集: {args.output_dir}/{args.module}_train.json ({len(result['train'])}个样本)")

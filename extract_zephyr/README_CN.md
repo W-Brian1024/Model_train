@@ -20,7 +20,7 @@ python3 app/generate_module_samples.py \
     --module-analysis dataset/ble_modules_analysis.json \
     --module host_gatt \
     --num-samples 100 \
-    --split-65-20-15
+    --split-70-20-10
 ```
 
 **输出文件：** `dataset/modules/host_gatt_train.json` 和 `host_gatt_validation.json`
@@ -58,7 +58,7 @@ for module in host_gatt host_att host_l2cap host_conn; do
     python3 app/generate_module_samples.py \
         --module $module \
         --num-samples 100 \
-        --split-65-20-15
+        --split-70-20-10
 done
 ```
 
@@ -66,8 +66,8 @@ done
 
 ## 📁 输出文件
 
-- `{module}_train.json` - 训练集（85个样本）
-- `{module}_validation.json` - 验证集（15个样本）
+- `{module}_train.json` - 训练集（90个样本 = 70原始+20偏差）
+- `{module}_validation.json` - 验证集（10个样本）
 - `{module}_complete.json` - 完整数据集（100个样本）
 
 ---
@@ -79,7 +79,7 @@ done
 | `--zephyr` | Zephyr 源码路径 | `/home/weng/code/ble/zephyr_sdk/zephyr` |
 | `--module` | 目标模块 ID | `host_gatt` |
 | `--num-samples` | 生成样本数量 | `50` |
-| `--split-65-20-15` | 启用 65:20:15 自动分割 | 无 |
+| `--split-70-20-10` | 启用 70:20:10 自动分割 | 无 |
 
 ---
 

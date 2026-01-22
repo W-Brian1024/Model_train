@@ -20,7 +20,7 @@ python3 app/generate_module_samples.py \
     --module-analysis dataset/ble_modules_analysis.json \
     --module host_gatt \
     --num-samples 100 \
-    --split-65-20-15
+    --split-70-20-10
 ```
 
 **Output:** `dataset/modules/host_gatt_train.json` and `host_gatt_validation.json`
@@ -58,7 +58,7 @@ for module in host_gatt host_att host_l2cap host_conn; do
     python3 app/generate_module_samples.py \
         --module $module \
         --num-samples 100 \
-        --split-65-20-15
+        --split-70-20-10
 done
 ```
 
@@ -66,8 +66,8 @@ done
 
 ## 📁 Output Files
 
-- `{module}_train.json` - Training set (85 samples)
-- `{module}_validation.json` - Validation set (15 samples)
+- `{module}_train.json` - Training set (90 samples = 70 original + 20 biased)
+- `{module}_validation.json` - Validation set (10 samples)
 - `{module}_complete.json` - Complete dataset (100 samples)
 
 ---
